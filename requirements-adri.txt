@@ -1,0 +1,5 @@
+requests
+geopandas
+matplotlib
+contextily
+follium
