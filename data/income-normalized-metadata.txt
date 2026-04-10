@@ -1,6 +1,0 @@
-Enllaç de l'aplicació: https://portaldades.ajuntament.barcelona.cat/ca/estad%C3%ADstiques/issbupxmdy
-Títol: Índex de la Renda disponible de les llars per càpita (RDLpc)
-Unitat: Índex
-Data de publicació : 2026-03-16T15:15:41Z
-Llicència: CC BY 4.0
-Tipus Filtre -> Temps: Any; Territori: Municipi, Districte, Barri
