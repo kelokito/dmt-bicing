@@ -3,3 +3,7 @@ geopandas
 matplotlib
 contextily
 follium
+pyarrow
+pandas
+py7zr
+requests
