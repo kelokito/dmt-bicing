@@ -54,9 +54,14 @@ def execute_values(
     conn.commit()
 
 
-def fetch_all(
-    conn: psycopg2.extensions.connection, sql: str, params: Any = None
-) -> list:
+def fetch_all(conn: psycopg2.extensions.connection, sql: str, params: Any = None) -> list:
     with conn.cursor() as cur:
-        cur.execute(sql, params)
-        return cur.fetchall()
+        try:
+            cur.execute(sql, params)
+            return cur.fetchall()
+        except Exception as e:
+            # THIS IS THE MAGIC LINE: 
+            # If the query fails, rollback the transaction immediately!
+            conn.rollback() 
+            print(f"Query Failed: {e}")
+            raise  # Re-raise the error so you know what actually went wrong
