@@ -109,16 +109,17 @@ def _rows_to_gdf(rows: list, columns: list, geom_col: str = "geom_wkt") -> gpd.G
 
 def load_data(
     conn,
-) -> tuple[gpd.GeoDataFrame, gpd.GeoDataFrame, pd.DataFrame, gpd.GeoDataFrame]:
+) -> tuple[gpd.GeoDataFrame, gpd.GeoDataFrame, pd.DataFrame, gpd.GeoDataFrame, gpd.GeoDataFrame]:
     """
     Load all required datasets from PostGIS.
 
     Returns
     -------
-    stations_gdf      GeoDataFrame (Point)   — one row per station
-    neighborhoods_gdf GeoDataFrame (Polygon) — one row per neighborhood
-    occupancy_df      DataFrame              — avg bike counts at HOUR_AM / HOUR_PM
-    maintenance_gdf   GeoDataFrame (Point)   — total maintenance events per station
+    stations_gdf             GeoDataFrame (Point)   — one row per station
+    neighborhoods_gdf        GeoDataFrame (Polygon) — one row per neighborhood
+    occupancy_df             DataFrame              — avg bike counts at HOUR_AM / HOUR_PM
+    maintenance_gdf          GeoDataFrame (Point)   — total maintenance events per station
+    maintenance_monthly_gdf  GeoDataFrame (Point)   — maintenance events per station per month
     """
     # ── Stations (point geometry, capacity, stored FK) ────────────────────────
     stations_gdf = _rows_to_gdf(
@@ -185,13 +186,35 @@ def load_data(
         ["station_id", "geom_wkt", "maintenance_count"],
     )
 
+    # ── Monthly maintenance breakdown (for temporal KPI analysis) ──────────────
+    maintenance_monthly_gdf = _rows_to_gdf(
+        fetch_all(conn, """
+            SELECT s.station_id,
+                   ST_AsText(s.geom)                                   AS geom_wkt,
+                   date_trunc('month', getTimestamp(inst))::date        AS year_month,
+                   COUNT(*)                                             AS maintenance_count
+            FROM   stations s
+            JOIN   station_status_mdb ss ON s.station_id = ss.station_id
+            CROSS  JOIN LATERAL unnest(instants(ss.status_history)) AS inst
+            WHERE  getValue(inst) = 'MAINTENANCE'
+            GROUP  BY s.station_id, ST_AsText(s.geom),
+                      date_trunc('month', getTimestamp(inst))
+            ORDER  BY year_month, maintenance_count DESC;
+        """),
+        ["station_id", "geom_wkt", "year_month", "maintenance_count"],
+    )
+    maintenance_monthly_gdf["station_id"] = maintenance_monthly_gdf["station_id"].astype(int)
+    maintenance_monthly_gdf["maintenance_count"] = maintenance_monthly_gdf["maintenance_count"].astype(int)
+    maintenance_monthly_gdf["year_month"] = pd.to_datetime(maintenance_monthly_gdf["year_month"])
+
     print(
         f"Loaded: {len(stations_gdf)} stations | "
         f"{len(neighborhoods_gdf)} neighborhoods | "
         f"{len(occupancy_df)} stations with occupancy | "
-        f"{len(maintenance_gdf)} stations with maintenance records"
+        f"{len(maintenance_gdf)} stations with maintenance records | "
+        f"{maintenance_monthly_gdf['year_month'].nunique()} maintenance months"
     )
-    return stations_gdf, neighborhoods_gdf, occupancy_df, maintenance_gdf
+    return stations_gdf, neighborhoods_gdf, occupancy_df, maintenance_gdf, maintenance_monthly_gdf
 
 
 # =============================================================================
@@ -427,6 +450,44 @@ def integrate(
     return integrated
 
 
+# ---------------------------------------------------------------------------
+# Monthly maintenance helpers  (used by KPI 3)
+# ---------------------------------------------------------------------------
+
+# Months with incomplete data excluded from temporal analysis (matches notebook)
+_EXCLUDED_MONTHS = frozenset({
+    pd.Timestamp("2024-12-01"),
+    pd.Timestamp("2025-10-01"),
+    pd.Timestamp("2025-11-01"),
+    pd.Timestamp("2026-01-01"),
+})
+
+
+def _expand_monthly_maintenance(maint_gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
+    """Reindex to fill missing (station, month) pairs with zero maintenance count."""
+    geom_by_id = (
+        maint_gdf[["station_id", "geometry"]]
+        .drop_duplicates("station_id")
+        .set_index("station_id")
+    )
+    all_months = pd.date_range(
+        maint_gdf["year_month"].min(), maint_gdf["year_month"].max(), freq="MS"
+    )
+    all_months = all_months[~all_months.isin(_EXCLUDED_MONTHS)]
+    full_idx = pd.MultiIndex.from_product(
+        [maint_gdf["station_id"].unique(), all_months],
+        names=["station_id", "year_month"],
+    )
+    expanded = (
+        pd.DataFrame(maint_gdf.drop(columns="geometry"))
+        .set_index(["station_id", "year_month"])
+        .reindex(full_idx, fill_value=0)
+        .reset_index()
+    )
+    expanded = expanded.merge(geom_by_id.reset_index(), on="station_id", how="left")
+    return gpd.GeoDataFrame(expanded, geometry="geometry", crs=CRS_GEO)
+
+
 # =============================================================================
 # SECTION 4  ·  KPI QUERIES
 # =============================================================================
@@ -600,6 +661,7 @@ def kpi2_supply_equity(
 def kpi3_maintenance_intensity(
     integrated: gpd.GeoDataFrame,
     neighborhoods_gdf: gpd.GeoDataFrame,
+    maintenance_monthly_gdf: gpd.GeoDataFrame | None = None,
 ) -> None:
     """
     KPI 3 — Maintenance intensity per neighborhood.
@@ -658,6 +720,166 @@ def kpi3_maintenance_intensity(
     print("  → saved kpi3_maintenance_intensity.png")
     plt.show()
 
+    if maintenance_monthly_gdf is None:
+        return
+
+    df_monthly = _expand_monthly_maintenance(maintenance_monthly_gdf)
+
+    # ── Top 5 stations: timeline + locator map ────────────────────────────────
+    top5_ids = (
+        df_monthly.groupby("station_id")["maintenance_count"]
+        .sum()
+        .nlargest(5)
+        .index.tolist()
+    )
+    df_top5 = df_monthly[df_monthly["station_id"].isin(top5_ids)]
+    _COLORS = ["#e41a1c", "#4daf4a", "#377eb8", "#ff7f00", "#984ea3"]
+
+    fig, (ax_line, ax_map) = plt.subplots(1, 2, figsize=(14, 5))
+    for sid, color in zip(top5_ids, _COLORS):
+        df_s = df_top5[df_top5["station_id"] == sid].sort_values("year_month")
+        ax_line.plot(
+            df_s["year_month"], df_s["maintenance_count"],
+            marker="o", color=color, label=f"Station {sid}", linewidth=1.5,
+        )
+    ax_line.set_xlabel("Year-Month")
+    ax_line.set_ylabel("Maintenance Count")
+    ax_line.set_title("Maintenance Count Over Time — Top 5 Stations")
+    ax_line.legend()
+    ax_line.tick_params(axis="x", rotation=45)
+    ax_line.grid(axis="y", linestyle="--", alpha=0.4)
+    ax_line.spines[["top", "right"]].set_visible(False)
+
+    neighborhoods_gdf.plot(ax=ax_map, color="lightblue", edgecolor="black", linewidth=0.5)
+    df_top5_pts = gpd.GeoDataFrame(
+        df_top5.groupby("station_id")["maintenance_count"]
+        .sum()
+        .reset_index()
+        .merge(
+            df_top5[["station_id", "geometry"]].drop_duplicates("station_id"),
+            on="station_id",
+        ),
+        geometry="geometry",
+        crs=CRS_GEO,
+    )
+    for sid, color in zip(top5_ids, _COLORS):
+        df_top5_pts[df_top5_pts["station_id"] == sid].plot(
+            ax=ax_map, color=color, markersize=60, zorder=5, label=f"Station {sid}"
+        )
+    ax_map.set_title("Top 5 Stations with Most Maintenance")
+    ax_map.axis("off")
+    ax_map.legend(loc="lower left", fontsize=8)
+    plt.tight_layout()
+    plt.savefig("kpi3_top_stations_timeline.png", dpi=150, bbox_inches="tight")
+    print("  → saved kpi3_top_stations_timeline.png")
+    plt.show()
+
+    # ── Total maintenance per month ───────────────────────────────────────────
+    month_totals = (
+        df_monthly.groupby("year_month")["maintenance_count"]
+        .sum()
+        .reset_index()
+        .sort_values("year_month")
+    )
+    fig, ax = plt.subplots(figsize=(10, 4))
+    ax.plot(
+        month_totals["year_month"], month_totals["maintenance_count"],
+        marker="o", linewidth=1.5, color="#2c7bb6",
+    )
+    ax.axvline(pd.Timestamp("2026-01-01"), color="red", linestyle="--",
+               linewidth=1.2, label="2026 boundary")
+    ax.set_xlabel("Year-Month")
+    ax.set_ylabel("Maintenance Count")
+    ax.set_title("KPI 3 — Total Maintenance Count Over Time")
+    ax.legend()
+    ax.tick_params(axis="x", rotation=45)
+    ax.grid(axis="y", linestyle="--", alpha=0.4)
+    ax.spines[["top", "right"]].set_visible(False)
+    plt.tight_layout()
+    plt.savefig("kpi3_monthly_total.png", dpi=150, bbox_inches="tight")
+    print("  → saved kpi3_monthly_total.png")
+    plt.show()
+
+    # ── Maintenance vs demographic variables ──────────────────────────────────
+    station_nbh = integrated[
+        ["station_id", "codi_barri", "population", "income_idx", "area_km2"]
+    ].drop_duplicates("station_id")
+    df_demo = (
+        df_monthly.merge(station_nbh, on="station_id", how="left")
+        .groupby(["codi_barri", "population", "income_idx", "area_km2"])
+        .agg(
+            total_maintenance=("maintenance_count", "sum"),
+            n_stations=("station_id", "nunique"),
+        )
+        .reset_index()
+    )
+    df_demo["maintenance_per_station"] = (
+        df_demo["total_maintenance"] / df_demo["n_stations"]
+    ).round(2)
+
+    fig, axes = plt.subplots(1, 3, figsize=(15, 4.5))
+    for ax, x_col, x_label in [
+        (axes[0], "population", "Population"),
+        (axes[1], "income_idx", "Income Index"),
+        (axes[2], "area_km2",   "Area (km²)"),
+    ]:
+        ax.scatter(
+            df_demo[x_col], df_demo["maintenance_per_station"],
+            alpha=0.7, edgecolors="white", linewidth=0.5, color="#2c7bb6",
+        )
+        ax.set_xlabel(x_label)
+        ax.set_ylabel("Maintenance per Station")
+        ax.set_title(f"Maintenance vs {x_label}")
+        ax.grid(linestyle="--", alpha=0.4)
+        ax.spines[["top", "right"]].set_visible(False)
+    plt.suptitle("KPI 3 — Maintenance vs Demographic Variables")
+    plt.tight_layout()
+    plt.savefig("kpi3_demographics.png", dpi=150, bbox_inches="tight")
+    print("  → saved kpi3_demographics.png")
+    plt.show()
+
+    # ── Monthly choropleth grid ───────────────────────────────────────────────
+    station_codi = integrated[["station_id", "codi_barri"]].drop_duplicates("station_id")
+    df_time_nbh = (
+        df_monthly.merge(station_codi, on="station_id", how="left")
+        .groupby(["codi_barri", "year_month"])["maintenance_count"]
+        .sum()
+        .reset_index()
+    )
+    months_sorted = sorted(df_monthly["year_month"].unique())
+    n_cols = 3
+    n_rows = (len(months_sorted) + n_cols - 1) // n_cols
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(n_cols * 5, n_rows * 4))
+    axes = axes.flatten()
+    vmax = df_time_nbh["maintenance_count"].max()
+
+    for idx, month in enumerate(months_sorted):
+        ax = axes[idx]
+        nbh_month = neighborhoods_gdf.merge(
+            df_time_nbh[df_time_nbh["year_month"] == month][["codi_barri", "maintenance_count"]],
+            on="codi_barri", how="left",
+        )
+        nbh_month.plot(
+            ax=ax, column="maintenance_count",
+            cmap="Reds", vmin=0, vmax=vmax, legend=False,
+            missing_kwds={"color": "#e0e0e0"},
+            edgecolor="white", linewidth=0.3,
+        )
+        ax.set_title(month.strftime("%B %Y"), fontsize=9)
+        ax.axis("off")
+
+    for idx in range(len(months_sorted), len(axes)):
+        axes[idx].set_visible(False)
+
+    sm = plt.cm.ScalarMappable(cmap="Reds", norm=plt.Normalize(vmin=0, vmax=vmax))
+    sm.set_array([])
+    fig.colorbar(sm, ax=axes[:len(months_sorted)], shrink=0.6, label="Maintenance Count")
+    fig.suptitle("KPI 3 — Monthly Maintenance Count by Neighborhood")
+    plt.tight_layout()
+    plt.savefig("kpi3_monthly_grid.png", dpi=150, bbox_inches="tight")
+    print("  → saved kpi3_monthly_grid.png")
+    plt.show()
+
 
 # =============================================================================
 # MAIN
@@ -668,7 +890,7 @@ def main(kpi_keys: list[str] | None = None) -> None:
 
     # 0. Load from PostGIS
     conn = connect()
-    stations_gdf, neighborhoods_gdf, occupancy_df, maintenance_gdf = load_data(conn)
+    stations_gdf, neighborhoods_gdf, occupancy_df, maintenance_gdf, maintenance_monthly_gdf = load_data(conn)
     conn.close()
 
     # 1. Clean
@@ -685,6 +907,9 @@ def main(kpi_keys: list[str] | None = None) -> None:
     )
 
     # 4. KPI queries
+    _extra_kwargs: dict[str, dict] = {
+        "kpi3": {"maintenance_monthly_gdf": maintenance_monthly_gdf},
+    }
     keys_to_run = kpi_keys or list(QUERY_REGISTRY)
     for key in keys_to_run:
         if key not in QUERY_REGISTRY:
@@ -693,7 +918,7 @@ def main(kpi_keys: list[str] | None = None) -> None:
                 f"Available: {list(QUERY_REGISTRY)}"
             )
             continue
-        QUERY_REGISTRY[key](integrated, neighborhoods_gdf)
+        QUERY_REGISTRY[key](integrated, neighborhoods_gdf, **_extra_kwargs.get(key, {}))
 
     print("\nPipeline complete.")
 
